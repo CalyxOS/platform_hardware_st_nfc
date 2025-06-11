@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "android_logmsg.h"
+#include "hal_event_logger.h"
 #include "hal_fd.h"
 #include "hal_fwlog.h"
 #include "halcore.h"
@@ -38,6 +39,7 @@ extern void I2cRecovery();
 
 static void halWrapperDataCallback(uint16_t data_len, uint8_t* p_data);
 static void halWrapperCallback(uint8_t event, uint8_t event_status);
+static std::string hal_wrapper_state_to_str(uint16_t event);
 
 nfc_stack_callback_t* mHalWrapperCallback = NULL;
 nfc_stack_data_callback_t* mHalWrapperDataCallback = NULL;
@@ -79,6 +81,9 @@ unsigned long hal_field_timer = 0;
 static bool sEnableFwLog = false;
 uint8_t mObserverMode = 0;
 bool mObserverRsp = false;
+bool mPerTechCmdRsp = false;
+bool storedLog = false;
+bool mObserveModeSuspended = false;
 
 void wait_ready() {
   pthread_mutex_lock(&mutex);
@@ -113,6 +118,7 @@ bool hal_wrapper_open(st21nfc_dev_t* dev, nfc_stack_callback_t* p_cback,
 
   mObserverMode = 0;
   mObserverRsp = false;
+  mObserveModeSuspended = false;
 
   mHalWrapperCallback = p_cback;
   mHalWrapperDataCallback = p_data_cback;
@@ -129,6 +135,8 @@ bool hal_wrapper_open(st21nfc_dev_t* dev, nfc_stack_callback_t* p_cback,
   isDebuggable = property_get_int32("ro.debuggable", 0);
   mHalHandle = *pHandle;
 
+  HalEventLogger::getInstance().initialize();
+  HalEventLogger::getInstance().log() << __func__ << std::endl;
   HalSendDownstreamTimer(mHalHandle, 10000);
 
   return 1;
@@ -139,6 +147,8 @@ int hal_wrapper_close(int call_cb, int nfc_mode) {
   uint8_t propNfcModeSetCmdQb[] = {0x2f, 0x02, 0x02, 0x02, (uint8_t)nfc_mode};
 
   mHalWrapperState = HAL_WRAPPER_STATE_CLOSING;
+  HalEventLogger::getInstance().log() << __func__ << std::endl;
+
   // Send PROP_NFC_MODE_SET_CMD
   if (!HalSendDownstreamTimer(mHalHandle, propNfcModeSetCmdQb,
                               sizeof(propNfcModeSetCmdQb), 100)) {
@@ -168,6 +178,7 @@ void hal_wrapper_send_core_config_prop() {
       STLOG_HAL_V("%s - Enter", __func__);
       set_ready(0);
 
+      HalEventLogger::getInstance().log() << __func__ << std::endl;
       if (!HalSendDownstreamTimer(mHalHandle, ConfigBuffer, retlen, 1000)) {
         STLOG_HAL_E("NFC-NCI HAL: %s  SendDownstream failed", __func__);
       }
@@ -183,6 +194,7 @@ void hal_wrapper_send_vs_config() {
   set_ready(0);
   mHalWrapperState = HAL_WRAPPER_STATE_PROP_CONFIG;
   mReadFwConfigDone = true;
+  HalEventLogger::getInstance().log() << __func__ << std::endl;
   if (!HalSendDownstreamTimer(mHalHandle, nciPropGetFwDbgTracesConfig,
                               sizeof(nciPropGetFwDbgTracesConfig), 1000)) {
     STLOG_HAL_E("%s - SendDownstream failed", __func__);
@@ -201,9 +213,11 @@ void hal_wrapper_factoryReset() {
   STLOG_HAL_V("%s - mfactoryReset = %d", __func__, mfactoryReset);
 }
 
-void hal_wrapper_set_observer_mode(uint8_t enable) {
+void hal_wrapper_set_observer_mode(uint8_t enable, bool per_tech_cmd) {
   mObserverMode = enable;
   mObserverRsp = true;
+  mPerTechCmdRsp = per_tech_cmd;
+  mObserveModeSuspended = false;
 }
 void hal_wrapper_get_observer_mode() { mObserverRsp = true; }
 
@@ -278,6 +292,8 @@ void halWrapperDataCallback(uint16_t data_len, uint8_t* p_data) {
             } else {
               STLOG_HAL_V("%s - Send APDU_GET_ATR_CMD", __func__);
               mRetryFwDwl--;
+              HalEventLogger::getInstance().log()
+                  << __func__ << " Send APDU_GET_ATR_CMD" << std::endl;
               if (!HalSendDownstreamTimer(mHalHandle, ApduGetAtr,
                                           sizeof(ApduGetAtr),
                                           FW_TIMER_DURATION)) {
@@ -338,6 +354,8 @@ void halWrapperDataCallback(uint16_t data_len, uint8_t* p_data) {
         STLOG_HAL_V("%s - Sending PROP_NFC_MODE_SET_CMD", __func__);
         // Send PROP_NFC_MODE_SET_CMD(ON)
         mHalWrapperState = HAL_WRAPPER_STATE_NFC_ENABLE_ON;
+        HalEventLogger::getInstance().log()
+            << __func__ << " Sending PROP_NFC_MODE_SET_CMD" << std::endl;
         if (!HalSendDownstreamTimer(mHalHandle, propNfcModeSetCmdOn,
                                     sizeof(propNfcModeSetCmdOn), 500)) {
           STLOG_HAL_E("NFC-NCI HAL: %s  HalSendDownstreamTimer failed",
@@ -423,8 +441,8 @@ void halWrapperDataCallback(uint16_t data_len, uint8_t* p_data) {
           // NFC_STATUS_OK
           if (p_data[3] == 0x00) {
             bool confNeeded = false;
-            bool firmware_debug_enabled =
-                property_get_int32("persist.vendor.nfc.firmware_debug_enabled", 0);
+            bool firmware_debug_enabled = property_get_int32(
+                "persist.vendor.nfc.firmware_debug_enabled", 0);
 
             // Check if FW DBG shall be set
             if (GetNumValue(NAME_STNFC_FW_DEBUG_ENABLED, &num, sizeof(num)) ||
@@ -477,8 +495,9 @@ void halWrapperDataCallback(uint16_t data_len, uint8_t* p_data) {
                     __func__);
               }
 
-              if (data_len < 9 || p_data[6] == 0 || p_data[6] < (data_len - 7)
-                  || p_data[6] > (sizeof(nciPropEnableFwDbgTraces) - 9)) {
+              if (data_len < 9 || p_data[6] == 0 ||
+                  p_data[6] < (data_len - 7) ||
+                  p_data[6] > (sizeof(nciPropEnableFwDbgTraces) - 9)) {
                 if (confNeeded) {
                   android_errorWriteLog(0x534e4554, "169328517");
                   confNeeded = false;
@@ -529,7 +548,7 @@ void halWrapperDataCallback(uint16_t data_len, uint8_t* p_data) {
           p_data[0] = 0x4f;
           p_data[1] = 0x0c;
           p_data[2] = 0x02;
-          p_data[3] = 0x02;
+          p_data[3] = mPerTechCmdRsp ? 0x05 : 0x02;
           p_data[4] = rsp_status;
           data_len = 0x5;
         } else if (((p_data[0] == 0x41) && (p_data[1] == 0x17) &&
@@ -543,7 +562,11 @@ void halWrapperDataCallback(uint16_t data_len, uint8_t* p_data) {
               STLOG_HAL_E("mObserverMode got out of sync");
               mObserverMode = p_data[4];
             }
+            if (!mObserveModeSuspended) {
             p_data[5] = p_data[4];
+            } else {
+              p_data[5] =  0x00;
+            }
           } else {
             if (p_data[7] != mObserverMode) {
               STLOG_HAL_E("mObserverMode got out of sync");
@@ -557,8 +580,56 @@ void halWrapperDataCallback(uint16_t data_len, uint8_t* p_data) {
           p_data[3] = 0x04;
           p_data[4] = rsp_status;
           data_len = 0x6;
+          DispHal("RX DATA", (p_data), data_len);
         }
       }
+
+      if ((p_data[0] == 0x4f) && (p_data[1] == 0x19)) {
+        p_data[4] = p_data[3];
+        p_data[0] = 0x4f;
+        p_data[1] = 0x0c;
+        p_data[2] = 0x02;
+        p_data[3] = 0x06;
+        data_len = 0x5;
+        DispHal("RX DATA", (p_data), data_len);
+      } else if ((p_data[0] == 0x6f) && (p_data[1] == 0x1b)) {
+        // PROP_RF_OBSERVE_MODE_SUSPENDED_NTF
+        mObserveModeSuspended = true;
+        // Remove two byte CRC at end of frame.
+        data_len -= 2;
+        p_data[2] -= 2;
+        p_data[4] -= 2;
+        memcpy(nciAndroidPassiveObserver, p_data + 3, data_len - 3);
+
+        p_data[0] = 0x6f;
+        p_data[1] = 0x0c;
+        p_data[2] = p_data[2] + 1;
+        p_data[3] = 0xB;
+        memcpy(p_data + 4, nciAndroidPassiveObserver, data_len - 3);
+        data_len = data_len + 1;
+        DispHal("RX DATA", (p_data), data_len);
+      } else if ((p_data[0] == 0x6f) && (p_data[1] == 0x1c)) {
+        // PROP_RF_OBSERVE_MODE_RESUMED_NTF
+        mObserveModeSuspended = false;
+
+        p_data[0] = 0x6f;
+        p_data[1] = 0x0c;
+        p_data[2] = p_data[2] + 1;
+        p_data[3] = 0xC;
+        data_len = data_len + 1;
+        DispHal("RX DATA", (p_data), data_len);
+      } else if ((p_data[0] == 0x4f) && (p_data[1] == 0x1d)) {
+        // PROP_RF_SET_CUST_PASSIVE_POLL_FRAME_RSP
+        memcpy(nciAndroidPassiveObserver, p_data + 3, data_len - 3);
+        p_data[4] = p_data[3];
+        p_data[0] = 0x4f;
+        p_data[1] = 0x0c;
+        p_data[2] = 0x02;
+        p_data[3] = 0x09;
+        data_len = 0x5;
+        DispHal("RX DATA", (p_data), data_len);
+      }
+
       if (!((p_data[0] == 0x60) && (p_data[3] == 0xa0))) {
         if (mHciCreditLent && (p_data[0] == 0x60) && (p_data[1] == 0x06)) {
           if (p_data[4] == 0x01) {  // HCI connection
@@ -580,6 +651,8 @@ void halWrapperDataCallback(uint16_t data_len, uint8_t* p_data) {
             // start timer
             if (hal_field_timer) {
               mFieldInfoTimerStarted = true;
+              HalEventLogger::getInstance().log()
+                  << __func__ << " LINE: " << __LINE__ << std::endl;
               HalSendDownstreamTimer(mHalHandle, 20000);
             }
           } else if (p_data[3] == 0x00) {
@@ -593,7 +666,6 @@ void halWrapperDataCallback(uint16_t data_len, uint8_t* p_data) {
           // start timer
           mTimerStarted = true;
           mIsActiveRW = true;
-          HalSendDownstreamTimer(mHalHandle, 5000);
           (void)pthread_mutex_unlock(&mutex_activerw);
         } else if ((p_data[0] == 0x6f) && (p_data[1] == 0x06)) {
           (void)pthread_mutex_lock(&mutex_activerw);
@@ -602,12 +674,12 @@ void halWrapperDataCallback(uint16_t data_len, uint8_t* p_data) {
             HalSendDownstreamStopTimer(mHalHandle);
             mTimerStarted = false;
           }
-          if(mIsActiveRW == true) {
+          if (mIsActiveRW == true) {
             mIsActiveRW = false;
           } else {
-            mError_count ++;
+            mError_count++;
             STLOG_HAL_E("Error Act -> Act count=%d", mError_count);
-            if(mError_count > 20) {
+            if (mError_count > 20) {
               mError_count = 0;
               STLOG_HAL_E("NFC Recovery Start");
               mTimerStarted = true;
@@ -628,7 +700,8 @@ void halWrapperDataCallback(uint16_t data_len, uint8_t* p_data) {
             mTimerStarted = false;
           }
         } else if (p_data[0] == 0x60 && p_data[1] == 0x00) {
-          STLOG_HAL_E("%s - Reset trigger from 0x%x to 0x0", __func__, p_data[3]);
+          STLOG_HAL_E("%s - Reset trigger from 0x%x to 0x0", __func__,
+                      p_data[3]);
           p_data[3] = 0x0;  // Only reset trigger that should be received in
                             // HAL_WRAPPER_STATE_READY is unreocoverable error.
           mHalWrapperState = HAL_WRAPPER_STATE_RECOVERY;
@@ -716,6 +789,9 @@ void halWrapperDataCallback(uint16_t data_len, uint8_t* p_data) {
             __func__);
         // start timer
         mTimerStarted = true;
+        HalEventLogger::getInstance().log()
+            << __func__ << " HAL_WRAPPER_STATE_SET_ACTIVERW_TIMER "
+            << std::endl;
         HalSendDownstreamTimer(mHalHandle, 5000);
         // Chip state should back to Active
         // at screen off state.
@@ -743,11 +819,14 @@ void halWrapperDataCallback(uint16_t data_len, uint8_t* p_data) {
       }
       break;
     case HAL_WRAPPER_STATE_RECOVERY:
+      STLOG_HAL_W("%s - mHalWrapperState = HAL_WRAPPER_STATE_RECOVERY",
+                  __func__);
       break;
   }
 }
 
-static void halWrapperCallback(uint8_t event, __attribute__((unused))uint8_t event_status) {
+static void halWrapperCallback(uint8_t event,
+                               __attribute__((unused)) uint8_t event_status) {
   uint8_t coreInitCmd[] = {0x20, 0x01, 0x02, 0x00, 0x00};
   uint8_t rfDeactivateCmd[] = {0x21, 0x06, 0x01, 0x00};
   uint8_t p_data[6];
@@ -769,7 +848,14 @@ static void halWrapperCallback(uint8_t event, __attribute__((unused))uint8_t eve
         STLOG_HAL_E("NFC-NCI HAL: %s  Timeout accessing the CLF.", __func__);
         HalSendDownstreamStopTimer(mHalHandle);
         I2cRecovery();
-        abort(); // TODO: fix it when we have a better recovery method.
+        HalEventLogger::getInstance().log()
+            << __func__ << " Timeout accessing the CLF."
+            << " mHalWrapperState="
+            << hal_wrapper_state_to_str(mHalWrapperState)
+            << " mIsActiveRW=" << mIsActiveRW
+            << " mTimerStarted=" << mTimerStarted << std::endl;
+        HalEventLogger::getInstance().store_log();
+        abort();  // TODO: fix it when we have a better recovery method.
         return;
       }
       break;
@@ -786,7 +872,14 @@ static void halWrapperCallback(uint8_t event, __attribute__((unused))uint8_t eve
       if (event == HAL_WRAPPER_TIMEOUT_EVT) {
         STLOG_HAL_E("%s - Timer for FW update procedure timeout, retry",
                     __func__);
-        abort(); // TODO: fix it when we have a better recovery method.
+        HalEventLogger::getInstance().log()
+            << __func__ << " Timer for FW update procedure timeout, retry"
+            << " mHalWrapperState="
+            << hal_wrapper_state_to_str(mHalWrapperState)
+            << " mIsActiveRW=" << mIsActiveRW
+            << " mTimerStarted=" << mTimerStarted << std::endl;
+        HalEventLogger::getInstance().store_log();
+        abort();  // TODO: fix it when we have a better recovery method.
         HalSendDownstreamStopTimer(mHalHandle);
         resetHandlerState();
         I2cResetPulse();
@@ -808,7 +901,14 @@ static void halWrapperCallback(uint8_t event, __attribute__((unused))uint8_t eve
     case HAL_WRAPPER_STATE_PROP_CONFIG:
       if (event == HAL_WRAPPER_TIMEOUT_EVT) {
         STLOG_HAL_E("%s - Timer when sending conf parameters, retry", __func__);
-        abort(); // TODO: fix it when we have a better recovery method.
+        HalEventLogger::getInstance().log()
+            << __func__ << " Timer when sending conf parameters, retry"
+            << " mHalWrapperState="
+            << hal_wrapper_state_to_str(mHalWrapperState)
+            << " mIsActiveRW=" << mIsActiveRW
+            << " mTimerStarted=" << mTimerStarted << std::endl;
+        HalEventLogger::getInstance().store_log();
+        abort();  // TODO: fix it when we have a better recovery method.
         HalSendDownstreamStopTimer(mHalHandle);
         resetHandlerState();
         I2cResetPulse();
@@ -847,7 +947,45 @@ static void halWrapperCallback(uint8_t event, __attribute__((unused))uint8_t eve
       }
       break;
 
+    case HAL_WRAPPER_STATE_EXIT_HIBERNATE_INTERNAL:
+      if (event == HAL_WRAPPER_TIMEOUT_EVT) {
+        STLOG_HAL_E("NFC-NCI HAL: %s  Timeout at state: %s", __func__,
+                    hal_wrapper_state_to_str(mHalWrapperState).c_str());
+        HalEventLogger::getInstance().log()
+            << __func__ << " Timer when sending conf parameters, retry"
+            << " mHalWrapperState="
+            << hal_wrapper_state_to_str(mHalWrapperState)
+            << " mIsActiveRW=" << mIsActiveRW
+            << " mTimerStarted=" << mTimerStarted << std::endl;
+        HalEventLogger::getInstance().store_log();
+        HalSendDownstreamStopTimer(mHalHandle);
+        p_data[0] = 0x60;
+        p_data[1] = 0x00;
+        p_data[2] = 0x03;
+        p_data[3] = 0xAB;
+        p_data[4] = 0x00;
+        p_data[5] = 0x00;
+        data_len = 0x6;
+        mHalWrapperDataCallback(data_len, p_data);
+        mHalWrapperState = HAL_WRAPPER_STATE_OPEN;
+        return;
+      }
+      break;
+
     default:
+      if (event == HAL_WRAPPER_TIMEOUT_EVT) {
+        STLOG_HAL_E("NFC-NCI HAL: %s  Timeout at state: %s", __func__,
+                    hal_wrapper_state_to_str(mHalWrapperState).c_str());
+        if (!storedLog) {
+          HalEventLogger::getInstance().log()
+              << __func__ << " Timeout at state: "
+              << hal_wrapper_state_to_str(mHalWrapperState)
+              << " mIsActiveRW=" << mIsActiveRW
+              << " mTimerStarted=" << mTimerStarted << std::endl;
+          HalEventLogger::getInstance().store_log();
+          storedLog = true;
+        }
+      }
       break;
   }
 
@@ -882,4 +1020,63 @@ void hal_wrapper_setFwLogging(bool enable) {
   ALOGD("%s : enable = %d", __func__, enable);
 
   sEnableFwLog = enable;
+}
+
+/*******************************************************************************
+ **
+ ** Function         hal_wrapper_dumplog
+ **
+ ** Description      Dump HAL event logs.
+ **
+ ** Returns          void
+ **
+ *******************************************************************************/
+void hal_wrapper_dumplog(int fd) {
+  ALOGD("%s : fd= %d", __func__, fd);
+
+  HalEventLogger::getInstance().dump_log(fd);
+}
+
+/*******************************************************************************
+**
+** Function         hal_wrapper_state_to_str
+**
+** Description      convert wrapper state to string
+**
+** Returns          string
+**
+*******************************************************************************/
+static std::string hal_wrapper_state_to_str(uint16_t event) {
+  switch (event) {
+    case HAL_WRAPPER_STATE_CLOSED:
+      return "HAL_WRAPPER_STATE_CLOSED";
+    case HAL_WRAPPER_STATE_OPEN:
+      return "HAL_WRAPPER_STATE_OPEN";
+    case HAL_WRAPPER_STATE_OPEN_CPLT:
+      return "HAL_WRAPPER_STATE_OPEN_CPLT";
+    case HAL_WRAPPER_STATE_NFC_ENABLE_ON:
+      return "HAL_WRAPPER_STATE_NFC_ENABLE_ON";
+    case HAL_WRAPPER_STATE_PROP_CONFIG:
+      return "HAL_WRAPPER_STATE_PROP_CONFIG";
+    case HAL_WRAPPER_STATE_READY:
+      return "HAL_WRAPPER_STATE_READY";
+    case HAL_WRAPPER_STATE_CLOSING:
+      return "HAL_WRAPPER_STATE_CLOSING";
+    case HAL_WRAPPER_STATE_EXIT_HIBERNATE_INTERNAL:
+      return "HAL_WRAPPER_STATE_EXIT_HIBERNATE_INTERNAL";
+    case HAL_WRAPPER_STATE_UPDATE:
+      return "HAL_WRAPPER_STATE_UPDATE";
+    case HAL_WRAPPER_STATE_APPLY_CUSTOM_PARAM:
+      return "HAL_WRAPPER_STATE_APPLY_CUSTOM_PARAM";
+    case HAL_WRAPPER_STATE_APPLY_UWB_PARAM:
+      return "HAL_WRAPPER_STATE_APPLY_UWB_PARAM";
+    case HAL_WRAPPER_STATE_SET_ACTIVERW_TIMER:
+      return "HAL_WRAPPER_STATE_SET_ACTIVERW_TIMER";
+    case HAL_WRAPPER_STATE_APPLY_PROP_CONFIG:
+      return "HAL_WRAPPER_STATE_APPLY_PROP_CONFIG";
+    case HAL_WRAPPER_STATE_RECOVERY:
+      return "HAL_WRAPPER_STATE_RECOVERY";
+    default:
+      return "Unknown";
+  }
 }

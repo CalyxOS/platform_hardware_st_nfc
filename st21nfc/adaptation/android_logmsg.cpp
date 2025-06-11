@@ -17,6 +17,7 @@
  *
  ******************************************************************************/
 #include "android_logmsg.h"
+
 #include <pthread.h>
 #include <stdio.h>
 
@@ -52,7 +53,9 @@ unsigned char InitializeSTLogLevel() {
   num = 1;
   if (GetNumValue(NAME_STNFC_HAL_LOGLEVEL, &num, sizeof(num))) {
     hal_conf_trace_level = (unsigned char)num;
-    hal_trace_level = hal_conf_trace_level;
+    if (hal_trace_level != STNFC_TRACE_LEVEL_VERBOSE) {
+      hal_trace_level = hal_conf_trace_level;
+    }
   }
 
   STLOG_HAL_D("%s: HAL log level=%u, hal_log_cnt (before reset): #%04X",
